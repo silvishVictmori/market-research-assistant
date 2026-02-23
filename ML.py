@@ -55,7 +55,7 @@ def validate_industry_with_wikipedia(
     min_signal_hits_per_doc: int = 1,
 ):
     """
-    Returns (is_valid, message, docs, urls)
+    Returns (is_valid, message, docs, title_url_pairs)
 
     Valid if:
     - non-empty input
@@ -63,33 +63,63 @@ def validate_industry_with_wikipedia(
     - we can extract exactly 5 distinct URLs (Step 2 requirement)
     - "industry-ness": at least `min_signal_docs` of the top docs have >= `min_signal_hits_per_doc`
       signal matches in title+snippet OR the query itself contains signals.
+
+    Improvements:
+    - Disambiguates broad queries by appending "industry" when needed
+    - Filters out irrelevant docs using signal hits
     """
     if not has_real_text(industry):
         return False, "Step 1: Please enter an industry (required).", [], []
 
-    # Retrieve more than 5 so we have enough to pick 5 distinct URLs.
-  
-    try:
-        docs = retriever.invoke(industry)
-    except Exception:
-        docs = retriever.get_relevant_documents(industry)
+    # Disambiguate broad queries
+    norm = normalize(industry)
+    query = industry
+    if all(k not in norm for k in ["industry", "sector", "market"]):
+        query = f"{industry} industry"
 
-    if not docs or len(docs) < min_results:
+    # Retrieve
+    try:
+        docs = retriever.invoke(query)
+    except Exception:
+        docs = retriever.get_relevant_documents(query)
+
+    if not docs:
+        return (
+            False,
+            f"Step 1: No Wikipedia results for '{industry}'. Try a clearer industry term.",
+            [],
+            [],
+        )
+
+    # Filter docs for industry relevance (title + snippet)
+    filtered = []
+    for d in docs:
+        md = d.metadata or {}
+        title = md.get("title") or md.get("page_title") or ""
+        snippet = (d.page_content or "")[:500]
+        if score_industry_signals(f"{title} {snippet}") >= min_signal_hits_per_doc:
+            filtered.append(d)
+
+    # Use filtered if it gives enough results; otherwise fall back to original docs
+    docs_to_use = filtered if len(filtered) >= min_results else docs
+
+    if len(docs_to_use) < min_results:
         return (
             False,
             f"Step 1: Not enough Wikipedia results for '{industry}'. Try a clearer industry term "
             "(e.g., 'semiconductor industry', 'banking sector').",
-            docs or [],
+            docs_to_use,
             [],
         )
 
-    title_url_pairs = extract_5_urls(docs)
+    # Extract exactly 5 distinct URLs (Step 2 requirement)
+    title_url_pairs = extract_5_urls(docs_to_use)
     if len(title_url_pairs) < 5:
         return (
             False,
             f"Step 1: I couldn’t extract 5 distinct Wikipedia URLs for '{industry}'. "
             "Try adding 'industry', 'sector', or a more specific term.",
-            docs,
+            docs_to_use,
             title_url_pairs,
         )
 
@@ -98,7 +128,7 @@ def validate_industry_with_wikipedia(
 
     # Signal check in top docs (title + first part of page content)
     signal_docs = 0
-    for d in docs[:min_results]:
+    for d in docs_to_use[:min_results]:
         md = d.metadata or {}
         title = md.get("title") or md.get("page_title") or ""
         snippet = (d.page_content or "")[:500]
@@ -111,11 +141,11 @@ def validate_industry_with_wikipedia(
             False,
             f"Step 1: '{industry}' doesn’t look like an industry term based on Wikipedia results. "
             "Try phrasing it like 'X industry' / 'X sector' / 'X market'.",
-            docs,
+            docs_to_use,
             title_url_pairs,
         )
 
-    return True, "OK", docs, title_url_pairs
+    return True, "OK", docs_to_use, title_url_pairs
 
 #Return up to 5 distinct URLs from doc metadata.
 def extract_5_urls(docs) -> list[tuple[str, str]]:
@@ -186,6 +216,36 @@ def take_bullets_up_to_words(bullets: list[str], max_words: int) -> str:
             break
     return "\n".join(out_lines)
 
+def clean_wiki_text(text: str) -> str:
+    t = (text or "").strip()
+
+    # normalize all whitespace
+    t = re.sub(r"\s+", " ", t)
+
+    # collapse spaces between digits and punctuation in numbers
+    t = re.sub(r"(?<=\d)\s*([.,])\s*(?=\d)", r"\1", t)
+    t = re.sub(r"(?<=\d)\s+(?=\d)", "", t)
+
+    # join sequences of single-letter tokens even if mixed with stray spaces:
+    def join_spelled(m):
+        return m.group(0).replace(" ", "")
+
+    t = re.sub(r"(?:\b[A-Za-z]\b\s+){2,}\b[A-Za-z]\b", join_spelled, t)
+
+    # clean spaces before punctuation
+    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+
+    return t
+
+def doc_text(d) -> str:
+    md = d.metadata or {}
+    # Try common metadata fields first (if present)
+    for k in ["summary", "description", "snippet", "content"]:
+        if md.get(k):
+            return str(md.get(k))
+    # Fallback to page_content
+    return d.page_content or ""
+    
 def build_report(industry: str, docs) -> str:
     titles: list[str] = []
     quick_defs: list[str] = []
@@ -196,58 +256,67 @@ def build_report(industry: str, docs) -> str:
         title = md.get("title") or md.get("page_title") or "Wikipedia page"
         titles.append(title)
 
-        content = (d.page_content or "").strip()
-        if content:
-            words = content.split()
+        content = clean_wiki_text(doc_text(d))
+        if not content:
+            continue
 
-             # Quick definition: first ~22 words (often reads like a definition)
-            qdef = " ".join(words[:22]).strip()
-            if qdef:
-                quick_defs.append(f"- {title}: {qdef}...")
+        # Prefer first sentence for definition (more "complete" than N words)
+        sentences = split_sentences(content)
+        if sentences:
+            first_sentence = sentences[0].strip()
+            # Keep definition concise
+            def_words = first_sentence.split()[:28]
+            quick_defs.append(f"- {title}: {' '.join(def_words).rstrip('.')}.")
+        else:
+            # fallback
+            quick_defs.append(f"- {title}: {' '.join(content.split()[:28]).rstrip('.') }.")
 
-            # Grounding snippet: a bit longer
-            snippet = " ".join(words[:45]).strip()
-            if snippet:
-                extracts.append(f"{title}: {snippet}.")
+        # Extracts: take 1–2 sentences to keep coherence
+        if len(sentences) >= 2:
+            extract_text = f"{sentences[0].strip()} {sentences[1].strip()}"
+        elif sentences:
+            extract_text = sentences[0].strip()
+        else:
+            extract_text = content
+        extracts.append(f"- {title}: {' '.join(extract_text.split()[:60]).rstrip('.') }.")
 
-    defs_block = take_bullets_up_to_words(quick_defs, max_words=120)
-    extracts_block = take_bullets_up_to_words(extracts, max_words=180)
 
-    narrative = f"""Industry report: {industry}.
+    defs_block = take_bullets_up_to_words(quick_defs, max_words=130)
+    extracts_block = take_bullets_up_to_words(extracts, max_words=220)
 
-Overview
-This report is grounded in the following Wikipedia topics: {", ".join(titles)}.
-It summarizes the industry’s basic definition, typical structure, and recurring themes as described by those pages.
+    narrative = (
+        f"**Industry report:** {industry}\n\n"
 
-Notable subtopics & quick definitions
-{defs_block if defs_block else "- (No extract text available.)"}
-
-Key themes
-- Scope & definition: What the industry includes, its core activities, and common boundaries.
-- Value chain: Typical upstream inputs, production/service delivery, and downstream customers/end users.
-- Enablers: Technologies, infrastructure, standards, and processes that commonly show up across the pages.
-- Ecosystem: Adjacent sectors, institutions, and public/private actors that influence outcomes.
-
-Current dynamics
-- Demand-side: The use-cases and adoption contexts implied by the descriptions (who uses the outputs and why).
-- Supply-side: Inputs, operational complexity, scaling constraints, and typical bottlenecks suggested by the coverage.
-- Differentiation: Where competition tends to focus (cost, performance, reliability, compliance, and distribution).
-
-Grounding extracts (snippets)
-{extracts_block if extracts_block else "- (No extract text available.)"}
-"""
-
-    final_report = enforce_lt_500_words_complete(
-        report_sections=[narrative],
-        max_words=500,
+        f"**Overview**\n\n"
+        f"Grounded Wikipedia topics (top matches): {', '.join(titles)}.\n\n"
+        "This report summarizes the industry’s definition, typical structure, and recurring themes as described by those pages.\n\n"
+    
+        "**Notable subtopics (quick definitions)**\n\n"
+        f"{defs_block if defs_block else '- (No extract text available.)'}\n\n"
+    
+        "**Key themes**\n\n"
+        "- Scope & definition: What the industry includes, its core activities, and common boundaries.\n"
+        "- Value chain: Typical upstream inputs, production/service delivery, and downstream customers/end users.\n"
+        "- Enablers: Technologies, infrastructure, standards, and processes that commonly show up across the pages.\n"
+        "- Ecosystem: Adjacent sectors, institutions, and public/private actors that influence outcomes.\n\n"
+    
+        "**Current dynamics**\n\n"
+        "- Demand-side: The use-cases and adoption contexts implied by the descriptions (who uses the outputs and why).\n"
+        "- Supply-side: Inputs, operational complexity, scaling constraints, and typical bottlenecks suggested by the coverage.\n"
+        "- Differentiation: Where competition tends to focus (cost, performance, reliability, compliance, and distribution).\n\n"
+    
+        "**Grounding extracts**\n\n"
+        f"{extracts_block if extracts_block else '- (No extract text available.)'}"
     )
 
-    # Safety net: if anything still slips through, hard-trim by words
+    final_report = narrative.strip()
+
     words = final_report.split()
     if len(words) > 500:
         final_report = " ".join(words[:500])
 
     return final_report
+
 
 #streamlit UI construction
 
@@ -363,7 +432,7 @@ with right:
 
         progress.progress(100)
         st.caption(f"Word count: {len(report.split())}")
-        st.write(report)
+        st.markdown(report)
 
         col_a, col_b = st.columns([1, 1])
         with col_a:
