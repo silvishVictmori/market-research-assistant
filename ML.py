@@ -3,10 +3,51 @@ import re
 import streamlit as st
 from langchain_community.retrievers import WikipediaRetriever
 
-os.environ["LANGSMITH_API_KEY"] = "PASTE_YOUR_KEY"
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_PROJECT"] = "industry-assistant"
+st.set_page_config(page_title="Industry Wikipedia Assistant", layout="wide")
 
+with st.sidebar:
+    st.markdown("## Settings")
+    st.caption("Provide your own API keys (stored only for this session).")
+
+    # LangSmith (optional). Safe default: app still works without it.
+    langsmith_key = st.text_input(
+        "LangSmith API key (optional)",
+        type="password",
+        placeholder="ls__...",
+        help="Used only for tracing/monitoring. Not required to run the app.",
+    )
+    langsmith_project = st.text_input(
+        "LangSmith project name (optional)",
+        value="industry-assistant",
+        help="Only used if a LangSmith API key is provided.",
+    )
+    enable_tracing = st.toggle(
+        "Enable LangSmith tracing",
+        value=False,
+        help="Only applies when LangSmith API key is provided.",
+    )
+
+    st.divider()
+    st.markdown("### Wikipedia settings")
+    top_k = st.slider(
+        "Retriever top_k_results",
+        min_value=5,
+        max_value=20,
+        value=10,
+        step=1,
+        help="Higher values may improve relevance but can be slower.",
+    )
+
+if langsmith_key:
+    os.environ["LANGSMITH_API_KEY"] = langsmith_key
+    os.environ["LANGSMITH_PROJECT"] = langsmith_project or "industry-assistant"
+    os.environ["LANGSMITH_TRACING"] = "true" if enable_tracing else "false"
+else:
+    # Ensure these defaults don't break runs on machines without LangSmith
+    os.environ.pop("LANGSMITH_API_KEY", None)
+    os.environ.pop("LANGSMITH_PROJECT", None)
+    os.environ.pop("LANGSMITH_TRACING", None)
+    
 # validate input
 
 def normalize(s: str) -> str:
@@ -362,7 +403,7 @@ with left:
         "Industry",
         value=st.session_state.industry,
         placeholder="e.g., automotive industry, fintech, pharmaceuticals",
-        label_visibility="visible",
+        label_visibility="collapsed",
     )
 
     run = st.button("Find sources (Step 2)", type="primary", use_container_width=True)
